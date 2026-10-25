@@ -8,18 +8,72 @@ export WINEPREFIX="$PREFIX"
 export WINEARCH=win64
 export WINEDEBUG="${WINEDEBUG:-fixme-all,err-winediag}"
 
-# Kill any prior session — Fusion refuses to run a second instance, and
-# WebView2/CER children survive a plain wineserver -k in a detached tree.
-pkill -9 -f cer_dialog 2>/dev/null || true
-pkill -9 -f msedgewebview2 2>/dev/null || true
-pkill -9 -f Fusion360.exe 2>/dev/null || true
-pkill -9 -f AdskIdentityManager.exe 2>/dev/null || true
+# End a prior session in THIS prefix — Fusion refuses to run a second instance,
+# and WebView2/CER children survive a plain wineserver -k in a detached tree.
+#
+# Only Wine processes whose WINEPREFIX is this prefix are touched. Fusion
+# instances in other prefixes keep running: the container shares the host's
+# PID namespace, so a `pkill -f Fusion360.exe` here would also end, e.g.,
+# sandboxed instances that overlay this prefix at another path (cx-reloaded's
+# test pool). A running Fusion360.exe may hold unsaved work, so it is ended only
+# after the user agrees; leftovers of a session whose Fusion is gone are not.
 
-wineserver -k 2>/dev/null || true
-for ws in "$HOME"/wine-versions/*/bin/wineserver "$HOME"/wine-versions/*/usr/bin/wineserver; do
-    [ -x "$ws" ] && "$ws" -k 2>/dev/null || true
-done
-sleep 2
+# PIDs of Wine processes (wine-preloader, wine64, wineserver, …) in this prefix.
+prefix_wine_pids() {
+    local env pid exe
+    for env in /proc/[0-9]*/environ; do
+        pid=${env#/proc/}
+        pid=${pid%/environ}
+        exe=$(readlink "/proc/$pid/exe" 2>/dev/null) || continue
+        case "${exe##*/}" in wine*) ;; *) continue ;; esac
+        tr '\0' '\n' <"$env" 2>/dev/null | grep -qxF "WINEPREFIX=$PREFIX" && echo "$pid"
+    done
+}
+
+# Ask a yes/no question: a desktop dialog (the host's zenity, through
+# distrobox-host-exec inside the container), else the terminal. Without
+# either, the answer is no: nothing is killed unasked.
+confirm() {
+    local zenity=()
+    if command -v zenity >/dev/null; then
+        zenity=(zenity)
+    elif command -v distrobox-host-exec >/dev/null \
+            && distrobox-host-exec sh -c 'command -v zenity' >/dev/null 2>&1; then
+        zenity=(distrobox-host-exec zenity)
+    fi
+    if [ ${#zenity[@]} -gt 0 ]; then
+        "${zenity[@]}" --question --title="Fusion is already running" --text="$1" \
+            --ok-label="End it and restart" --cancel-label="Keep it" 2>/dev/null
+        return
+    fi
+    if [ -t 0 ]; then
+        local answer
+        read -r -p "$1 [y/N] " answer
+        [[ "$answer" == [yY]* ]]
+        return
+    fi
+    echo "$1 — no dialog or terminal to ask; leaving it running." >&2
+    return 1
+}
+
+mapfile -t STALE < <(prefix_wine_pids)
+if [ ${#STALE[@]} -gt 0 ]; then
+    for pid in "${STALE[@]}"; do
+        if [ "$(cat "/proc/$pid/comm" 2>/dev/null)" = Fusion360.exe ]; then
+            confirm "Fusion is already running from $PREFIX. End it (unsaved work is lost) and start a new session?" \
+                || exit 0
+            break
+        fi
+    done
+    echo "[$(date +%H:%M:%S)] ending ${#STALE[@]} Wine process(es) of the prior session in $PREFIX"
+    kill -9 "${STALE[@]}" 2>/dev/null || true
+    # WINEPREFIX is exported above, so each -k ends only this prefix's wineserver.
+    wineserver -k 2>/dev/null || true
+    for ws in "$HOME"/wine-versions/*/bin/wineserver "$HOME"/wine-versions/*/usr/bin/wineserver; do
+        [ -x "$ws" ] && "$ws" -k 2>/dev/null || true
+    done
+    sleep 2
+fi
 
 # WINEDLLOVERRIDES:
 #   bcp47langs=       — IDM's GetUserLanguages import is unimplemented; without

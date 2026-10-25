@@ -97,9 +97,11 @@ bash scripts/install-host-handler.sh
 #   WINEPREFIX_FUSION=/var/mnt/code/distrobox/fusion-box/.wine-fusion bash scripts/install-fusion-launcher.sh
 bash scripts/install-fusion-launcher.sh
 
-# Launch Fusion (kills any prior wineserver first) — or just click the launcher.
+# Launch Fusion — or just click the launcher.
 distrobox enter fusion-box -- bash scripts/launch-fusion.sh
 ```
+
+Before it starts Fusion, the launcher ends the prior session in its own prefix only (Wine processes whose `WINEPREFIX` is that prefix), so Wine programs in other prefixes keep running. If Fusion itself is still running there, it asks first (a zenity dialog on the host, else the terminal) and leaves it alone when it cannot ask.
 
 The launcher writes Fusion's output to `~/.cache/fusion-box/fusion.log` (a file, because Fusion's bundled Node.js service crashes on the inherited podman pipe under wine). It also keeps Fusion's light/dark theme in sync with the desktop: with Fusion's default UI theme "Match OS", Fusion follows the freedesktop portal `color-scheme` setting (GNOME/KDE light or dark), live while it runs. Pick "Dark" or "Light" in Fusion's preferences to pin a theme instead.
 
