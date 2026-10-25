@@ -26,11 +26,13 @@ sleep 2
 #                       this override wine aborts before IDM inits.
 #   winewayland.drv=b — native Wayland driver (XWayland renders Qt6 as black).
 #                       FUSION_FORCE_X11=1 falls back for diagnostics.
+#   winemenubuilder.exe= — no host .desktop/MIME/icon entries; they would run
+#                       host wine on this prefix, outside the container.
 DRIVER_OVERRIDE='winewayland.drv=b;winex11.drv='
 if [ "${FUSION_FORCE_X11:-0}" = 1 ]; then
     DRIVER_OVERRIDE='winewayland.drv=;winex11.drv=b'
 fi
-export WINEDLLOVERRIDES="${WINEDLLOVERRIDES:+$WINEDLLOVERRIDES;}${DRIVER_OVERRIDE:+$DRIVER_OVERRIDE;}bcp47langs="
+export WINEDLLOVERRIDES="${WINEDLLOVERRIDES:+$WINEDLLOVERRIDES;}${DRIVER_OVERRIDE:+$DRIVER_OVERRIDE;}bcp47langs=;winemenubuilder.exe="
 
 # Wine binary: $WINE_BIN > patched build from build-wine.sh > system wine.
 PATCHED_WINE="$HOME/wine-versions/wine-11.10-fusion/bin/wine"

@@ -36,6 +36,9 @@ command -v curl       >/dev/null || die "curl not on PATH"
 export WINEPREFIX="$PREFIX"
 export WINEARCH=win64
 export WINEDEBUG="${WINEDEBUG:-fixme-all,err-winediag}"
+# No host .desktop/MIME/icon entries from installers; they would run host wine on
+# this prefix, outside the container.
+export WINEDLLOVERRIDES="${WINEDLLOVERRIDES:+$WINEDLLOVERRIDES;}winemenubuilder.exe="
 
 phase_wineboot() {
     if [ -d "$PREFIX/drive_c/windows/system32" ]; then
