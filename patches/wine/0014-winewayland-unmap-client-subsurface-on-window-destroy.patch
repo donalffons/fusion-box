@@ -1,0 +1,56 @@
+# fusion-box wine patch 0014
+# Unmap a client (DXVK/Vulkan) wl_subsurface when its window is destroyed.
+#
+# Bug: after closing the last open design, Fusion switches to its Home tab,
+# but the window shows a broken mix of the Home tab and leftover content.
+# The 3D viewport's window is destroyed on close, but the last frame it
+# presented stays on screen above the Home tab.
+#
+# Root cause: patch 0003 turned wayland_client_surface_attach(client, NULL)
+# into a no-op, so subsurfaces survive transient hide/show without z-order
+# churn. wayland_client_surface_detach() also goes through attach(NULL), but
+# win32u only calls detach when the window is gone: from DestroyWindow, from
+# thread-exit window cleanup, and from the final client_surface_release()
+# (which destroys the surface right after anyway). detach also clears
+# data->client_surface, so patch 0003's orphan reaper can no longer find it.
+# Result: the wl_subsurface stays mapped with its last buffer for as long as
+# the app holds its swapchain, and nothing in win32u will ever re-attach it
+# (win32u sets client->hwnd = NULL after detach).
+#
+# Fix: in wayland_client_surface_detach, destroy the wl_subsurface directly
+# (what upstream's attach(NULL) did) instead of calling attach(NULL).
+# Destroying a wl_subsurface unmaps its wl_surface immediately. Transient
+# hide/show still goes through attach(NULL) and keeps patch 0003's behavior.
+#
+# Verification: 2026-10-25, GNOME 50 (Mutter), NVIDIA RTX 3000 Ada,
+# debug/wine-tests/child-destroy-subsurface.c:
+#   without this patch: the destroyed child's panel stays on screen.
+#   with this patch:    the panel disappears; trace shows
+#                       "[fusion-box patch 0014] window destroyed, unmapping".
+#
+# Related:
+#   - patches/wine/0003-winewayland-keep-client-subsurface-alive-across-detach.patch
+
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -1282,7 +1282,19 @@
+     if ((data = wayland_win_data_get(client->hwnd)))
+     {
+         if (data->client_surface == surface) data->client_surface = NULL;
+-        wayland_client_surface_attach(surface, NULL);
++        /* fusion-box patch 0014: win32u only detaches when the window is being
++         * destroyed, so this is never the transient detach patch 0003 keeps
++         * alive. Destroy the wl_subsurface (unmaps it) instead of calling
++         * wayland_client_surface_attach(NULL), which patch 0003 turned into a
++         * no-op: the app may still hold its swapchain, and the last frame
++         * would otherwise stay on screen. See patch 0014 header. */
++        if (surface->wl_subsurface)
++        {
++            TRACE("[fusion-box patch 0014] window destroyed, unmapping client hwnd=%p\n", client->hwnd);
++            wl_subsurface_destroy(surface->wl_subsurface);
++            surface->wl_subsurface = NULL;
++        }
++        surface->toplevel = 0;
+         wayland_win_data_release(data);
+     }
+ }
