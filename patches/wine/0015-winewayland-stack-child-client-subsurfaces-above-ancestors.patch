@@ -1,0 +1,143 @@
+# fusion-box wine patch 0015
+# Stack a child window's client (DXVK/Vulkan) wl_subsurface above its
+# ancestors' client subsurfaces.
+#
+# Bug: Fusion's Home tab (shown at startup and after closing the last
+# design) is solid black below the app bar.
+#
+# Root cause: Win32 draws a child window above its parent's client area.
+# winewayland makes every client surface a sibling wl_subsurface of the
+# toplevel's wl_surface, and a new wl_subsurface goes on top of its
+# siblings. Stacking therefore follows creation order, not the window tree.
+# Fusion's Home tab is a chain of same-sized native Qt windows
+# (600dc > 600da > 700e2 > 900d6), each with its own D3D11 swapchain. The
+# innermost one (the Home page) gets its swapchain first; its ancestors'
+# swapchains come later and cover it. The topmost ancestor draws the app bar
+# and leaves the area of its child window black. Design documents look
+# fine because their viewport windows are created later and land on top.
+# Patch 0002 removed the place_above calls that used to reshuffle client
+# subsurfaces, so nothing fixes the order afterwards.
+#
+# Fix: when a client subsurface is (re)anchored, place the client
+# subsurfaces of the window's descendants (same toplevel) above it,
+# shallowest first, then let patch 0008 raise overlays above the topmost
+# of them.
+#
+# Verification: 2026-10-25, GNOME 50 (Mutter), NVIDIA RTX 3000 Ada,
+# Fusion 2706.1.14. Before: Home tab black (DXVK_HUD showed the app bar's
+# swapchain covering the whole area). After: trace shows
+#   "[fusion-box patch 0015] client hwnd=0x900d6 (depth 3) restacked above ancestor hwnd=0x600dc"
+# (and depth 2/1 for the next two ancestors) and the Home page renders.
+#
+# Depends on patches 0002, 0003 and 0008.
+
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -429,6 +429,7 @@
+ /* fusion-box: raise overlay siblings above a (re)anchored client subsurface.
+  * See patch 0008. */
+ void raise_overlay_siblings_above_client(struct wl_surface *client_wl_surface, HWND toplevel);
++struct wl_surface *raise_client_descendants_above(struct wl_surface *client_wl_surface, HWND hwnd, HWND toplevel);
+ 
+ struct wayland_client_surface *get_client_surface(HWND hwnd);
+ void set_client_surface(HWND hwnd, struct wayland_client_surface *client);
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -226,6 +226,80 @@
+           raised, toplevel);
+ }
+ 
++/* fusion-box patch 0015: number of GA_PARENT steps from hwnd up to ancestor,
++ * or 0 if ancestor is not an ancestor of hwnd. */
++static int window_depth_below(HWND hwnd, HWND ancestor)
++{
++    HWND desktop = NtUserGetDesktopWindow();
++    int depth = 0;
++
++    while (hwnd && hwnd != desktop && depth < 64)
++    {
++        hwnd = NtUserGetAncestor(hwnd, GA_PARENT);
++        depth++;
++        if (hwnd == ancestor) return depth;
++    }
++    return 0;
++}
++
++/***********************************************************************
++ *           raise_client_descendants_above  (patch 0015)
++ *
++ * Win32 draws a child window above its parent's client area, but every
++ * client (DXVK/Vulkan) wl_subsurface is a sibling under the toplevel's
++ * wl_surface, stacked by creation order. An ancestor whose client surface
++ * is (re)anchored after a descendant's lands on top and hides it. Restack
++ * the client surfaces of hwnd's descendants above hwnd's, shallowest
++ * first. Returns the topmost of them (or client_wl_surface), so callers
++ * can stack overlays above it. See patch 0015 header.
++ */
++struct wl_surface *raise_client_descendants_above(struct wl_surface *client_wl_surface, HWND hwnd, HWND toplevel)
++{
++    struct { int depth; struct wl_subsurface *sub; struct wl_surface *surf; HWND hwnd; } found[32], tmp;
++    struct wl_surface *anchor = client_wl_surface;
++    struct wayland_win_data *entry;
++    int count = 0, i, j;
++
++    if (!hwnd || !toplevel || !client_wl_surface) return client_wl_surface;
++
++    pthread_once(&win_data_mutex_once, win_data_mutex_init);
++    pthread_mutex_lock(&win_data_mutex);
++    RB_FOR_EACH_ENTRY(entry, &win_data_rb, struct wayland_win_data, entry)
++    {
++        struct wayland_client_surface *cli = entry->client_surface;
++        int depth;
++
++        if (!cli || !cli->wl_subsurface || cli->toplevel != toplevel) continue;
++        if (cli->wl_surface == client_wl_surface) continue;
++        if (!(depth = window_depth_below(entry->hwnd, hwnd))) continue;
++        if (count == ARRAY_SIZE(found)) break;
++        found[count].depth = depth;
++        found[count].sub = cli->wl_subsurface;
++        found[count].surf = cli->wl_surface;
++        found[count].hwnd = entry->hwnd;
++        count++;
++    }
++
++    for (i = 1; i < count; i++)  /* insertion sort, shallowest first */
++        for (j = i; j > 0 && found[j - 1].depth > found[j].depth; j--)
++        {
++            tmp = found[j];
++            found[j] = found[j - 1];
++            found[j - 1] = tmp;
++        }
++
++    for (i = 0; i < count; i++)
++    {
++        wl_subsurface_place_above(found[i].sub, anchor);
++        anchor = found[i].surf;
++        TRACE("[fusion-box patch 0015] client hwnd=%p (depth %d) restacked above ancestor hwnd=%p\n",
++              found[i].hwnd, found[i].depth, hwnd);
++    }
++    pthread_mutex_unlock(&win_data_mutex);
++
++    return anchor;
++}
++
+ /***********************************************************************
+  *              get_mwm_decoration_for_style
+  */
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -1420,9 +1420,11 @@
+ 
+         client->toplevel = toplevel;
+ 
+-        /* fusion-box: lift sibling overlays back above this fresh client
+-         * subsurface (raised us to TOP by spec). See patch 0008. */
+-        raise_overlay_siblings_above_client(client->wl_surface, toplevel);
++        /* fusion-box: put descendants' client subsurfaces back above this
++         * fresh one (patch 0015), then lift sibling overlays above them all
++         * (raised us to TOP by spec). See patches 0008 and 0015. */
++        raise_overlay_siblings_above_client(raise_client_descendants_above(client->wl_surface, hwnd, toplevel),
++                                            toplevel);
+     }
+     /* If client->toplevel == toplevel AND wl_subsurface already exists,
+      * we just reconfigure position/size below - no destroy, no recreate,
