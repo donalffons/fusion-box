@@ -101,6 +101,8 @@ bash scripts/install-fusion-launcher.sh
 distrobox enter fusion-box -- bash scripts/launch-fusion.sh
 ```
 
+The launcher writes Fusion's output to `~/.cache/fusion-box/fusion.log` (a file, because Fusion's bundled Node.js service crashes on the inherited podman pipe under wine). It also keeps Fusion's light/dark theme in sync with the desktop: with Fusion's default UI theme "Match OS", Fusion follows the freedesktop portal `color-scheme` setting (GNOME/KDE light or dark), live while it runs. Pick "Dark" or "Light" in Fusion's preferences to pin a theme instead.
+
 ### Uninstall
 
 ```bash

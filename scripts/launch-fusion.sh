@@ -83,6 +83,42 @@ if [ -z "$FUSION_EXE" ]; then
     exit 1
 fi
 
+# Follow the desktop's light/dark preference. Fusion's default "Match OS" UI theme reads
+# the Windows AppsUseLightTheme value; color-scheme.exe (built here from color-scheme.c)
+# sets it and broadcasts the change, so a running Fusion switches live. The desktop side
+# is the freedesktop portal setting org.freedesktop.appearance color-scheme
+# (1 = prefer dark, 0/2 = light), which GNOME and KDE both provide.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+COLOR_SCHEME_EXE="$HOME/.cache/fusion-box/color-scheme.exe"
+if [ "$SCRIPT_DIR/color-scheme.c" -nt "$COLOR_SCHEME_EXE" ]; then
+    mkdir -p "$(dirname "$COLOR_SCHEME_EXE")"
+    x86_64-w64-mingw32-gcc -O2 -o "$COLOR_SCHEME_EXE" "$SCRIPT_DIR/color-scheme.c" \
+        || echo "WARN: could not build color-scheme.exe; Fusion won't follow the desktop theme"
+fi
+
+sync_color_scheme() {
+    local scheme=light
+    [ -f "$COLOR_SCHEME_EXE" ] || return 0
+    case "$(gdbus call --session --dest org.freedesktop.portal.Desktop \
+                --object-path /org/freedesktop/portal/desktop \
+                --method org.freedesktop.portal.Settings.Read \
+                org.freedesktop.appearance color-scheme 2>/dev/null)" in
+        *"uint32 1"*) scheme=dark ;;
+        "") return 0 ;;  # portal unreachable: leave the prefix as it is
+    esac
+    "$WINE_BIN" "$COLOR_SCHEME_EXE" "$scheme" >/dev/null 2>&1 || true
+}
+
+watch_color_scheme() {
+    gdbus monitor --session --dest org.freedesktop.portal.Desktop \
+        --object-path /org/freedesktop/portal/desktop 2>/dev/null |
+    while read -r line; do
+        case "$line" in *"'org.freedesktop.appearance', 'color-scheme'"*) sync_color_scheme ;; esac
+    done
+}
+
+sync_color_scheme
+
 # Pre-warm IDSDK. Wine's CreateProcess cold-start (~15s) races against
 # Fusion's 15s SSO-readiness timeout; losing gives error 3213. Polling
 # the IDM log lets a fast start not waste time. Opt out: FUSION_PREWARM_IDM=0.
@@ -132,9 +168,17 @@ case "$FUSION_QT_TEXT_ENGINE" in
                  QT_PLATFORM_ARG="windows:fontengine=freetype" ;;
 esac
 
+# Fusion's output goes to a file, not the inherited podman-exec pipe: wine reports those
+# pipes as Windows pipes that Node.js can't open (Error: open EBADF), which kills Fusion's
+# bundled FremontJs service ("FremontJs is not healthy" in Fusion's log).
+FUSION_LOG="$HOME/.cache/fusion-box/fusion.log"
+mkdir -p "$(dirname "$FUSION_LOG")"
+echo "[$(date +%H:%M:%S)] launching Fusion; output goes to $FUSION_LOG"
+
+watch_color_scheme &
+WATCHER=$!
+trap 'pkill -P "$WATCHER" 2>/dev/null || true' EXIT
+
 cd "$(dirname "$FUSION_EXE")"
-if [ -n "$QT_PLATFORM_ARG" ]; then
-    exec "$WINE_BIN" Fusion360.exe -platform "$QT_PLATFORM_ARG" "$@"
-else
-    exec "$WINE_BIN" Fusion360.exe "$@"
-fi
+"$WINE_BIN" Fusion360.exe ${QT_PLATFORM_ARG:+-platform "$QT_PLATFORM_ARG"} "$@" \
+    >"$FUSION_LOG" 2>&1 </dev/null
